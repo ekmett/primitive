@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, MagicHash, UnboxedTuples, DeriveDataTypeable, BangPatterns #-}
+{-# LANGUAGE CPP, MagicHash, UnboxedTuples, DeriveDataTypeable, BangPatterns, TypeFamilies #-}
 
 -- |
 -- Module      : Data.Primitive.Array
@@ -22,16 +22,21 @@ module Data.Primitive.Array (
 
 import Control.Monad.Primitive
 
-import GHC.Base  ( Int(..) )
-import GHC.Prim
+import Data.Foldable as Foldable
+import Data.Traversable
 
 import Data.Typeable ( Typeable )
 import Data.Data ( Data(..) )
 import Data.Primitive.Internal.Compat ( isTrue#, mkNoRepType )
+import GHC.ST
+import GHC.Prim
+import GHC.Exts
 
 #if !(__GLASGOW_HASKELL__ >= 702)
 import Control.Monad.ST(runST)
 #endif
+
+import Prelude
 
 -- | Boxed arrays
 data Array a = Array (Array# a) deriving ( Typeable )
@@ -170,7 +175,7 @@ cloneArray :: Array a -- ^ source array
            -> Array a
 {-# INLINE cloneArray #-}
 #if __GLASGOW_HASKELL__ >= 702
-cloneArray (Array arr#) (I# off#) (I# len#) 
+cloneArray (Array arr#) (I# off#) (I# len#)
   = case cloneArray# arr# off# len# of arr'# -> Array arr'#
 #else
 cloneArray arr off len = runST $ do
@@ -213,3 +218,90 @@ instance (Typeable s, Typeable a) => Data (MutableArray s a) where
   toConstr _ = error "toConstr"
   gunfold _ _ = error "gunfold"
   dataTypeOf _ = mkNoRepType "Data.Primitive.Array.MutableArray"
+
+instance Functor Array where
+  fmap f !i = runST $ do
+    let n = size i
+    o <- newArray n undefined
+    let go !k
+          | k == n = return ()
+          | otherwise = do
+            a <- indexArrayM i k
+            writeArray o k (f a)
+            go (k+1)
+    go 0
+    unsafeFreezeArray o
+
+#if __GLASGOW_HASKELL__ >= 708
+
+instance IsList (Array a) where
+  type Item (Array a) = a
+  toList = Foldable.toList
+  fromListN n xs0 = runST $ do
+    arr <- newArray n undefined
+    let go !_ []     = return ()
+        go k (x:xs) = writeArray arr k x >> go (k+1) xs
+    go 0 xs0
+    unsafeFreezeArray arr
+  fromList xs = fromListN (length xs) xs
+
+#else
+
+fromListN :: Int -> [a] -> Array a
+fromListN n xs0 = runST $ do
+  arr <- newArray n undefined
+  let go !_ []     = return ()
+      go k (x:xs) = writeArray arr k x >> go (k+1) xs
+  go 0 xs0
+  unsafeFreezeArray arr
+
+fromList :: [a] -> Array a
+fromList xs = fromListN (length xs) xs
+
+#endif
+
+instance Foldable Array where
+  foldr f z arr = go 0 where
+    n = size arr
+    go !k
+      | k == n    = z
+      | otherwise = f (indexArray arr k) (go (k+1))
+
+  foldl f z arr = go (size arr - 1) where
+    go !k
+      | k < 0 = z
+      | otherwise = f (go (k-1)) (indexArray arr k)
+
+  foldr' f z arr = go 0 where
+    n = size arr
+    go !k
+      | k == n    = z
+      | r <- indexArray arr k = r `seq` f r (go (k+1))
+
+  foldl' f z arr = go (size arr - 1) where
+    go !k
+      | k < 0 = z
+      | r <- indexArray arr k = r `seq` f (go (k-1)) r
+
+  length = size
+  {-# INLINE length #-}
+
+size :: Array a -> Int
+size (Array ary) = I# (sizeofArray# ary)
+{-# INLINE size #-}
+
+instance Traversable Array where
+  traverse f a = fromListN (size a) <$> traverse f (Foldable.toList a)
+
+instance Show a => Show (Array a) where
+  showsPrec d as = showParen (d > 10) $
+    showString "fromList " . showsPrec 11 (Foldable.toList as)
+
+instance Read a => Read (Array a) where
+  readsPrec d = readParen (d > 10) $ \s -> [(fromList m, u) | ("fromList",t) <- lex s, (m,u) <- readsPrec 11 t]
+
+instance Ord a => Ord (Array a) where
+  compare as bs = compare (Foldable.toList as) (Foldable.toList bs)
+
+instance Eq a => Eq (Array a) where
+  as == bs = size as == size bs && Foldable.toList as == Foldable.toList bs
